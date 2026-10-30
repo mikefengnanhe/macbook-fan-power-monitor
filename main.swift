@@ -65,6 +65,30 @@ enum FanMode: Equatable {
     }
 }
 
+/// 内建屏幕亮度：通过系统私有框架 DisplayServices 读写，无需 root
+enum Brightness {
+    typealias GetFn = @convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32
+    typealias SetFn = @convention(c) (UInt32, Float) -> Int32
+    static let lib = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW)
+    static let getFn = lib.flatMap { dlsym($0, "DisplayServicesGetBrightness") }.map { unsafeBitCast($0, to: GetFn.self) }
+    static let setFn = lib.flatMap { dlsym($0, "DisplayServicesSetBrightness") }.map { unsafeBitCast($0, to: SetFn.self) }
+
+    static var display: CGDirectDisplayID? {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16), n: UInt32 = 0
+        CGGetOnlineDisplayList(16, &ids, &n)
+        return ids.prefix(Int(n)).first { CGDisplayIsBuiltin($0) != 0 }
+    }
+    static func get() -> Float? {
+        guard let d = display, let getFn else { return nil }
+        var v: Float = 0
+        return getFn(d, &v) == 0 ? v : nil
+    }
+    static func set(_ v: Float) -> Bool {
+        guard let d = display, let setFn else { return false }
+        return setFn(d, min(max(v, 0), 1)) == 0
+    }
+}
+
 let helperPath = "/Library/PrivilegedHelperTools/powerbar-fan"
 /// 温度曲线预设：名称、起始温度、满速温度
 let curves: [(zh: String, en: String, lo: Double, hi: Double)] = [
@@ -74,13 +98,14 @@ let curves: [(zh: String, en: String, lo: Double, hi: Double)] = [
     ("极限", "Extreme", 25, 60),
 ]
 
-final class App: NSObject, NSApplicationDelegate {
+final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
     let systemLine = NSMenuItem(), sourceLine = NSMenuItem(), batteryLine = NSMenuItem()
     let cpuLine = NSMenuItem(), gpuLine = NSMenuItem(), fanLine = NSMenuItem()
     let statsLine = NSMenuItem(), timeLine = NSMenuItem()
     let fanMenu = NSMenu(), installItem = NSMenuItem()
+    let brightnessMenu = NSMenu(), brightnessItem = NSMenuItem()
     var timer: Timer?, fanTimer: Timer?
     var interval: TimeInterval = UserDefaults.standard.object(forKey: "interval") as? Double ?? 5
     var fanMode = FanMode(key: UserDefaults.standard.string(forKey: "fanMode") ?? "auto")
@@ -119,6 +144,17 @@ final class App: NSObject, NSApplicationDelegate {
             buildFanMenu()
             let f = menu.addItem(withTitle: L("风扇模式", "Fan Mode"), action: nil, keyEquivalent: "")
             menu.setSubmenu(fanMenu, for: f)
+        }
+        if Brightness.get() != nil {
+            menu.addItem(.separator())
+            for pct in [0, 20, 50, 70, 100] {
+                let i = brightnessMenu.addItem(withTitle: "\(pct)%", action: #selector(setBrightness(_:)), keyEquivalent: "")
+                i.target = self; i.tag = pct
+            }
+            brightnessMenu.delegate = self
+            menu.addItem(brightnessItem)
+            menu.setSubmenu(brightnessMenu, for: brightnessItem)
+            updateBrightness()
         }
         menu.addItem(.separator())
         [statsLine, timeLine].forEach(menu.addItem)
@@ -208,6 +244,24 @@ final class App: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(interval, forKey: "interval")
         s.menu?.items.forEach { $0.state = $0 == s ? .on : .off }
         startTimer()
+    }
+
+    // MARK: 屏幕亮度
+
+    func menuNeedsUpdate(_ m: NSMenu) { updateBrightness() }  // 打开时读取当前亮度（可能被键盘调过）
+
+    func updateBrightness() {
+        guard let v = Brightness.get() else { return }
+        let pct = Int((v * 100).rounded())
+        brightnessItem.title = L("屏幕亮度：\(pct)%", "Display Brightness: \(pct)%")
+        brightnessMenu.items.forEach { $0.state = abs($0.tag - pct) <= 1 ? .on : .off }
+    }
+
+    @objc func setBrightness(_ s: NSMenuItem) {
+        if !Brightness.set(Float(s.tag) / 100) {
+            alert(L("调节亮度失败", "Failed to set brightness"), L("无法控制内建屏幕亮度", "Cannot control built-in display brightness"))
+        }
+        updateBrightness()
     }
 
     // MARK: 风扇

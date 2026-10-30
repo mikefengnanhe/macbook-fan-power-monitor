@@ -2,7 +2,7 @@
 
 [中文说明](README.zh-CN.md)
 
-A tiny menu bar app for Apple Silicon MacBooks that shows **real-time power draw, CPU/GPU temperature and fan speed**, and lets you **run the fans faster than Apple's default curve** for better cooling.
+A tiny menu bar app for Apple Silicon MacBooks that shows **real-time power draw, CPU/GPU temperature and fan speed**, lets you **run the fans faster than Apple's default curve** for better cooling, and switches **display brightness** in one click.
 
 - No Dock icon, ~30 MB memory, near-zero CPU
 - Reading power, temperature and fans needs no admin rights
@@ -19,6 +19,7 @@ A tiny menu bar app for Apple Silicon MacBooks that shows **real-time power draw
 - Fan speeds and who controls them (system or PowerBar)
 - Average and peak power since launch, reset statistics
 - Refresh interval: 2 / 5 / 10 / 30 s or manual only (⌘R refreshes)
+- Display brightness presets: 0% / 20% / 50% / 70% / 100% in one click (built-in display)
 - Launch at login
 
 **Fan modes:**
@@ -85,6 +86,7 @@ sudo rm /Library/PrivilegedHelperTools/powerbar-fan
 - Curves map the hottest CPU sensor linearly from the fan's minimum to maximum speed between the two temperatures; speeds are re-checked every 3 seconds.
 - Apple Silicon only throttles at roughly 100°C+, so temperatures of 60–80°C under load are normal and safe.
 - Faster fans lower temperatures by a few degrees, especially under sustained load, at the cost of noise and some extra fan wear.
+- Brightness uses the system's DisplayServices framework and only affects the built-in display. 0% is the lowest backlight level and is very dark.
 - Use at your own risk. The helper never sets fans below their minimum speed.
 
 ## Project layout
