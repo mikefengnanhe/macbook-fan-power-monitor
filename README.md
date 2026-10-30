@@ -26,7 +26,10 @@ A tiny menu bar app for Apple Silicon MacBooks that shows **real-time power draw
 | Mode | Behavior |
 |---|---|
 | Automatic | Apple's default fan control |
-| Temperature curve | Fans start ramping up at 35°C CPU and reach full speed at 70°C |
+| Gentle curve | Ramp from 50°C CPU, full speed at 85°C — quiet, still cooler than default |
+| Balanced curve | Ramp from 40°C, full speed at 75°C |
+| Aggressive curve | Ramp from 35°C, full speed at 70°C |
+| Extreme curve | Ramp from 25°C, full speed at 60°C — fans near maximum under almost any load |
 | Fixed 3000 / 4000 / 5000 RPM | Fans held at a constant speed |
 | Maximum | Fans at their maximum speed |
 
@@ -79,6 +82,8 @@ sudo rm /Library/PrivilegedHelperTools/powerbar-fan
 
 - Power data comes from the battery controller's telemetry (`AppleSmartBattery`), which macOS updates only every ~20–30 seconds.
 - Temperatures and fans are read from the SMC (`Tp*`/`Te*` keys for CPU cores, `Tg*` for GPU).
+- Curves map the hottest CPU sensor linearly from the fan's minimum to maximum speed between the two temperatures; speeds are re-checked every 3 seconds.
+- Apple Silicon only throttles at roughly 100°C+, so temperatures of 60–80°C under load are normal and safe.
 - Faster fans lower temperatures by a few degrees, especially under sustained load, at the cost of noise and some extra fan wear.
 - Use at your own risk. The helper never sets fans below their minimum speed.
 

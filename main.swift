@@ -44,21 +44,35 @@ struct TempGroup {
 
 enum FanMode: Equatable {
     case auto              // 系统自动
-    case curve             // 按 CPU 温度加速：curveLow°C 起最低速，curveHigh°C 满速
+    case curve(Double, Double)  // 按 CPU 温度加速：低点°C 起离开最低速，高点°C 满速
     case fixed(Double)     // 固定转速
 
     var key: String {
-        switch self { case .auto: "auto"; case .curve: "curve"; case .fixed(let r): "fixed:\(Int(r))" }
+        switch self {
+        case .auto: "auto"
+        case .curve(let lo, let hi): "curve:\(Int(lo))-\(Int(hi))"
+        case .fixed(let r): "fixed:\(Int(r))"
+        }
     }
     init(key: String) {
-        if key == "curve" { self = .curve }
+        if key == "curve" { self = .curve(35, 70) }  // 兼容 1.0 保存的设置
+        else if key.hasPrefix("curve:") {
+            let p = key.dropFirst(6).split(separator: "-").compactMap { Double($0) }
+            self = p.count == 2 && p[1] > p[0] ? .curve(p[0], p[1]) : .auto
+        }
         else if key.hasPrefix("fixed:"), let r = Double(key.dropFirst(6)) { self = .fixed(r) }
         else { self = .auto }
     }
 }
 
 let helperPath = "/Library/PrivilegedHelperTools/powerbar-fan"
-let curveLow = 35.0, curveHigh = 70.0
+/// 温度曲线预设：名称、起始温度、满速温度
+let curves: [(zh: String, en: String, lo: Double, hi: Double)] = [
+    ("温和", "Gentle", 50, 85),
+    ("均衡", "Balanced", 40, 75),
+    ("激进", "Aggressive", 35, 70),
+    ("极限", "Extreme", 25, 60),
+]
 
 final class App: NSObject, NSApplicationDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -210,9 +224,11 @@ final class App: NSObject, NSApplicationDelegate {
     func buildFanMenu() {
         fanMenu.removeAllItems()
         var modes: [(String, FanMode)] = [
-            (L("自动（系统默认）", "Automatic (system default)"), .auto),
-            (L("温度加速曲线（\(Int(curveLow))°C 起加速，\(Int(curveHigh))°C 满速）",
-               "Temperature curve (ramp from \(Int(curveLow))°C, full speed at \(Int(curveHigh))°C)"), .curve)]
+            (L("自动（系统默认）", "Automatic (system default)"), .auto)]
+        for c in curves {
+            modes.append((L("\(c.zh)曲线（\(Int(c.lo))°C 起加速，\(Int(c.hi))°C 满速）",
+                            "\(c.en) curve (ramp from \(Int(c.lo))°C, full speed at \(Int(c.hi))°C)"), .curve(c.lo, c.hi)))
+        }
         for r in [3000.0, 4000, 5000] where r > fanMin && r < fanMax {
             modes.append((L("固定 \(Int(r)) RPM", "Fixed \(Int(r)) RPM"), .fixed(r)))
         }
@@ -258,9 +274,9 @@ final class App: NSObject, NSApplicationDelegate {
         switch fanMode {
         case .auto: return
         case .fixed(let r): target = r
-        case .curve:
-            let t = cpu.read(smc)?.max ?? curveHigh
-            let k = min(max((t - curveLow) / (curveHigh - curveLow), 0), 1)
+        case .curve(let lo, let hi):
+            let t = cpu.read(smc)?.max ?? hi
+            let k = min(max((t - lo) / (hi - lo), 0), 1)
             target = ((fanMin + k * (fanMax - fanMin)) / 100).rounded() * 100 // 按 100 RPM 取整
         }
         // 目标变化不大且 SMC 仍在手动模式时不重复调用，减少开销
