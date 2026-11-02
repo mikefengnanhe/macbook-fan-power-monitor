@@ -1,8 +1,9 @@
 // PowerBar：菜单栏功耗 / 温度 / 风扇监测（Apple Silicon MacBook），界面跟随系统语言显示中文或英文
 // 功耗读 AppleSmartBattery 电源遥测，温度和风扇读 SMC，均无需 sudo；
-// 调节风扇需要 root，通过安装到 /Library/PrivilegedHelperTools 的 powerbar-fan 完成。
+// 调节风扇和充电上限需要 root，通过安装到 /Library/PrivilegedHelperTools 的 powerbar-fan 完成。
 import Cocoa
 import IOKit
+import IOKit.pwr_mgt
 import ServiceManagement
 
 struct Reading {
@@ -89,9 +90,73 @@ enum Brightness {
     }
 }
 
+/// 外接显示器亮度：通过 DDC/CI（VCP 0x10）经 IOAVService 读写，无需 root；不支持 DDC 的显示器自动跳过
+enum ExternalBrightness {
+    typealias CreateFn = @convention(c) (CFAllocator?, io_service_t) -> Unmanaged<CFTypeRef>?
+    typealias I2CFn = @convention(c) (CFTypeRef, UInt32, UInt32, UnsafeMutableRawPointer, UInt32) -> IOReturn
+    static let lib = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW)
+    static let create = lib.flatMap { dlsym($0, "IOAVServiceCreateWithService") }.map { unsafeBitCast($0, to: CreateFn.self) }
+    static let readI2C = lib.flatMap { dlsym($0, "IOAVServiceReadI2C") }.map { unsafeBitCast($0, to: I2CFn.self) }
+    static let writeI2C = lib.flatMap { dlsym($0, "IOAVServiceWriteI2C") }.map { unsafeBitCast($0, to: I2CFn.self) }
+
+    /// 当前连接的所有外接显示器的 AV 服务
+    static var services: [CFTypeRef] {
+        guard let create else { return [] }
+        var it: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPAVServiceProxy"), &it) == KERN_SUCCESS else { return [] }
+        defer { IOObjectRelease(it) }
+        var out: [CFTypeRef] = []
+        while case let s = IOIteratorNext(it), s != 0 {
+            defer { IOObjectRelease(s) }
+            let loc = IORegistryEntryCreateCFProperty(s, "Location" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? String
+            if loc == "External", let av = create(kCFAllocatorDefault, s)?.takeRetainedValue() { out.append(av) }
+        }
+        return out
+    }
+
+    /// DDC 包：地址 0x51 开头，末尾是与目标地址 0x6E 一起计算的异或校验
+    static func send(_ av: CFTypeRef, _ body: [UInt8]) -> Bool {
+        guard let writeI2C else { return false }
+        var pkt = body + [body.reduce(0x6E ^ 0x51, ^)]
+        return writeI2C(av, 0x37, 0x51, &pkt, UInt32(pkt.count)) == kIOReturnSuccess
+    }
+
+    /// 读取 (当前值, 最大值)
+    static func read(_ av: CFTypeRef) -> (cur: Int, max: Int)? {
+        guard let readI2C else { return nil }
+        for _ in 0..<3 {  // DDC 偶尔丢包，重试几次
+            guard send(av, [0x82, 0x01, 0x10]) else { continue }
+            usleep(40_000)
+            var b = [UInt8](repeating: 0, count: 12)
+            if readI2C(av, 0x37, 0x51, &b, 12) == kIOReturnSuccess, b[2] == 0x02, b[3] == 0, b[4] == 0x10 {
+                let mx = Int(b[6]) << 8 | Int(b[7])
+                if mx > 0 { return (Int(b[8]) << 8 | Int(b[9]), mx) }
+            }
+        }
+        return nil
+    }
+
+    /// 第一台可读的外接显示器的亮度（0~1）
+    static func get() -> Float? {
+        for av in services { if let r = read(av) { return Float(r.cur) / Float(r.max) } }
+        return nil
+    }
+
+    /// 把所有外接显示器设到 v（0~1），返回成功的台数
+    @discardableResult
+    static func set(_ v: Float) -> Int {
+        services.filter { av in
+            let mx = read(av)?.max ?? 100
+            let val = Int((min(max(v, 0), 1) * Float(mx)).rounded())
+            return send(av, [0x84, 0x03, 0x10, UInt8(val >> 8), UInt8(val & 0xff)])
+        }.count
+    }
+}
+
 let helperPath = "/Library/PrivilegedHelperTools/powerbar-fan"
 /// 温度曲线预设：名称、起始温度、满速温度
 let curves: [(zh: String, en: String, lo: Double, hi: Double)] = [
+    ("日常", "Everyday", 40, 90),
     ("温和", "Gentle", 50, 85),
     ("均衡", "Balanced", 40, 75),
     ("激进", "Aggressive", 35, 70),
@@ -106,7 +171,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let statsLine = NSMenuItem(), timeLine = NSMenuItem()
     let fanMenu = NSMenu(), installItem = NSMenuItem()
     let brightnessMenu = NSMenu(), brightnessItem = NSMenuItem()
-    var timer: Timer?, fanTimer: Timer?
+    let chargeMenu = NSMenu(), chargeItem = NSMenuItem(), fullItem = NSMenuItem(), chargeInstallItem = NSMenuItem()
+    var timer: Timer?, fanTimer: Timer?, chargeTimer: Timer?
+    /// 充电上限百分比，0 表示关闭（系统默认充到 100%）
+    var chargeLimit = UserDefaults.standard.object(forKey: "chargeLimit") as? Int ?? 80
+    /// 临时充满一次，拔掉电源后自动恢复上限
+    var fullOnce = UserDefaults.standard.bool(forKey: "fullOnce")
+    var lastOnAC: Bool?
+    var sleepAssertion: IOPMAssertionID = 0
     var interval: TimeInterval = UserDefaults.standard.object(forKey: "interval") as? Double ?? 5
     var fanMode = FanMode(key: UserDefaults.standard.string(forKey: "fanMode") ?? "auto")
     var total = 0.0, count = 0, peak = 0.0
@@ -121,6 +193,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var helperInstalled: Bool {
         guard let a = try? FileManager.default.attributesOfItem(atPath: helperPath) else { return false }
         return (a[.ownerAccountID] as? Int) == 0 && ((a[.posixPermissions] as? Int ?? 0) & 0o4000) != 0
+    }
+    /// 已安装的组件与 app 自带的一致（旧版组件不支持充电控制）
+    var helperCurrent: Bool {
+        guard helperInstalled, let src = Bundle.main.path(forResource: "powerbar-fan", ofType: nil) else { return false }
+        return FileManager.default.contentsEqual(atPath: src, andPath: helperPath)
+    }
+    /// SMC 当前是否暂停了充电（读取无需 root）
+    var chargingPaused: Bool {
+        guard let smc else { return false }
+        if let (_, b) = smc.read("CHTE") { return b.first == 1 }
+        return smc.read("CH0B")?.1.first == 2
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -138,6 +221,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             l.isEnabled = false
         }
         [systemLine, sourceLine, batteryLine].forEach(menu.addItem)
+        if smc?.read("CHTE") != nil || smc?.read("CH0B") != nil {
+            fullItem.title = L("充满到 100%（拔掉电源后恢复上限）", "Charge to 100% (limit resumes after unplugging)")
+            fullItem.action = #selector(toggleFullOnce); fullItem.target = self
+            menu.addItem(fullItem)
+            menu.addItem(chargeItem)
+            menu.setSubmenu(chargeMenu, for: chargeItem)
+            buildChargeMenu()
+        }
         menu.addItem(.separator())
         [cpuLine, gpuLine, fanLine].forEach(menu.addItem)
         if fanCount > 0 {
@@ -145,15 +236,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let f = menu.addItem(withTitle: L("风扇模式", "Fan Mode"), action: nil, keyEquivalent: "")
             menu.setSubmenu(fanMenu, for: f)
         }
-        if Brightness.get() != nil {
+        if Brightness.get() != nil || !ExternalBrightness.services.isEmpty {
             menu.addItem(.separator())
-            for pct in [0, 20, 50, 70, 100] {
+            for pct in [20, 50, 70, 100] {
                 let i = brightnessMenu.addItem(withTitle: "\(pct)%", action: #selector(setBrightness(_:)), keyEquivalent: "")
                 i.target = self; i.tag = pct
             }
             brightnessMenu.delegate = self
             menu.addItem(brightnessItem)
             menu.setSubmenu(brightnessMenu, for: brightnessItem)
+            // 亮度 0% 单独放在一级菜单，一键关暗屏幕
+            let off = menu.addItem(withTitle: L("屏幕亮度调到 0%", "Set Brightness to 0%"),
+                                   action: #selector(setBrightness(_:)), keyEquivalent: "")
+            off.target = self; off.tag = 0
             updateBrightness()
         }
         menu.addItem(.separator())
@@ -181,16 +276,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
         startTimer()
         applyFanMode()
+        chargeTick()
+        chargeTimer = makeTimer(20) { [weak self] in self?.chargeTick() }
 
         // 睡眠唤醒后 SMC 可能恢复自动，重新应用一次
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
                                                           object: nil, queue: .main) { [weak self] _ in
-            self?.lastTarget = nil; self?.applyFanMode()
+            self?.lastTarget = nil; self?.applyFanMode(); self?.chargeTick()
         }
     }
 
     func applicationWillTerminate(_ n: Notification) {
         if fanMode != .auto { _ = runHelper(["auto"]) }  // 退出时把风扇交还给系统
+        if chargingPaused { _ = runHelper(["charge", "on"]) }  // 退出时恢复充电，避免一直不充
+        setPreventSleep(false)
     }
 
     // MARK: 刷新
@@ -234,6 +333,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             gpuLine.title = String(format: L("GPU 温度：最高 %.1f°C · 平均 %.1f°C", "GPU temp: max %.1f°C · avg %.1f°C"), g.max, g.avg)
         } else { gpuLine.title = L("GPU 温度：不可用", "GPU temp: unavailable") }
         updateFanLine()
+        if let r = readPower(), chargeItem.menu != nil {
+            title += "  \(r.percent)%" + (chargingPaused ? "⏸︎" : r.battery > 0.05 ? "↑" : "")
+        }
         item.button?.title = title
     }
 
@@ -246,20 +348,94 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startTimer()
     }
 
+    // MARK: 充电上限
+
+    func buildChargeMenu() {
+        chargeMenu.removeAllItems()
+        let ok = helperCurrent
+        for pct in [70, 80, 90, 0] {
+            let name = pct == 0 ? L("关闭（系统默认，充到 100%）", "Off (system default, charge to 100%)")
+                                : pct == 80 ? L("80%（推荐）", "80% (recommended)") : "\(pct)%"
+            let i = chargeMenu.addItem(withTitle: name, action: #selector(chooseChargeLimit(_:)), keyEquivalent: "")
+            i.target = self; i.tag = pct
+            i.state = pct == chargeLimit ? .on : .off
+            i.isEnabled = ok || pct == 0
+        }
+        if !ok {
+            chargeMenu.addItem(.separator())
+            chargeInstallItem.title = helperInstalled ? L("更新控制组件以支持充电上限（需要管理员密码）…", "Update Helper for Charge Limit (admin password required)…")
+                                                      : L("安装控制组件（需要管理员密码）…", "Install Helper (admin password required)…")
+            chargeInstallItem.action = #selector(installHelper); chargeInstallItem.target = self
+            chargeMenu.addItem(chargeInstallItem)
+        }
+        chargeItem.title = chargeLimit == 0 ? L("充电上限：关闭", "Charge Limit: Off")
+                                            : L("充电上限：\(chargeLimit)%", "Charge Limit: \(chargeLimit)%")
+        fullItem.state = fullOnce ? .on : .off
+        fullItem.isEnabled = ok && chargeLimit > 0
+    }
+
+    @objc func chooseChargeLimit(_ s: NSMenuItem) {
+        chargeLimit = s.tag
+        UserDefaults.standard.set(chargeLimit, forKey: "chargeLimit")
+        buildChargeMenu(); chargeTick(); refresh()
+    }
+
+    @objc func toggleFullOnce() {
+        fullOnce.toggle()
+        UserDefaults.standard.set(fullOnce, forKey: "fullOnce")
+        buildChargeMenu(); chargeTick(); refresh()
+    }
+
+    /// 每 20 秒检查一次：到达上限暂停充电，低于上限 3% 恢复充电（避免频繁切换）
+    func chargeTick() {
+        guard chargeItem.menu != nil, let r = readPower() else { return }
+        if lastOnAC == true && !r.onAC && fullOnce {  // 拔掉电源，临时充满结束
+            fullOnce = false; UserDefaults.standard.set(false, forKey: "fullOnce"); buildChargeMenu()
+        }
+        lastOnAC = r.onAC
+        guard helperCurrent else { setPreventSleep(false); return }
+
+        let paused = chargingPaused
+        var pause = paused
+        if chargeLimit == 0 || fullOnce { pause = false }
+        else if r.percent >= chargeLimit { pause = true }
+        else if r.percent <= chargeLimit - 3 { pause = false }
+        if pause != paused, let err = runHelper(["charge", pause ? "off" : "on"]) {
+            chargeLimit = 0; UserDefaults.standard.set(0, forKey: "chargeLimit"); buildChargeMenu()
+            alert(L("设置充电失败，已关闭充电上限", "Failed to control charging; charge limit turned off"), err)
+            pause = false
+        }
+        // 插着电往上限充时阻止系统睡眠，否则合盖睡眠期间会一路充到 100%
+        setPreventSleep(r.onAC && !pause && chargeLimit > 0 && !fullOnce)
+    }
+
+    func setPreventSleep(_ on: Bool) {
+        if on && sleepAssertion == 0 {
+            IOPMAssertionCreateWithName(kIOPMAssertionTypePreventSystemSleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                        "PowerBar: charging to limit" as CFString, &sleepAssertion)
+        } else if !on && sleepAssertion != 0 {
+            IOPMAssertionRelease(sleepAssertion); sleepAssertion = 0
+        }
+    }
+
     // MARK: 屏幕亮度
 
     func menuNeedsUpdate(_ m: NSMenu) { updateBrightness() }  // 打开时读取当前亮度（可能被键盘调过）
 
     func updateBrightness() {
-        guard let v = Brightness.get() else { return }
+        guard let v = Brightness.get() ?? ExternalBrightness.get() else { return }
         let pct = Int((v * 100).rounded())
         brightnessItem.title = L("屏幕亮度：\(pct)%", "Display Brightness: \(pct)%")
+        brightnessItem.toolTip = L("同时调节内建屏幕和外接显示器", "Adjusts the built-in and external displays together")
         brightnessMenu.items.forEach { $0.state = abs($0.tag - pct) <= 1 ? .on : .off }
     }
 
     @objc func setBrightness(_ s: NSMenuItem) {
-        if !Brightness.set(Float(s.tag) / 100) {
-            alert(L("调节亮度失败", "Failed to set brightness"), L("无法控制内建屏幕亮度", "Cannot control built-in display brightness"))
+        let v = Float(s.tag) / 100
+        let builtin = Brightness.display != nil && Brightness.set(v)
+        let external = ExternalBrightness.set(v)  // 没有外接显示器或不支持 DDC 时为 0，直接跳过
+        if !builtin && external == 0 {
+            alert(L("调节亮度失败", "Failed to set brightness"), L("没有可调节亮度的屏幕", "No display with adjustable brightness"))
         }
         updateBrightness()
     }
@@ -374,6 +550,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert(L("安装失败", "Installation failed"), e[NSAppleScript.errorMessage] as? String ?? "\(e)")
         }
         buildFanMenu()
+        if chargeItem.menu != nil { buildChargeMenu(); chargeTick(); refresh() }
     }
 
     func alert(_ title: String, _ text: String) {
